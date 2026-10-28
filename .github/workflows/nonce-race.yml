@@ -7,105 +7,98 @@ on:
   workflow_dispatch:
     inputs:
       deadline_sec:
-        description: Solver deadline seconds (default 900)
+        description: Solver deadline seconds (default 880)
         required: false
-        default: '900'
+        default: '880'
 
 jobs:
   race:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        solver: [cadical, kissat, nonceflow, fps]
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Install solvers
+
+      - name: Unpack solvers
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq cadical cryptominisat5
-          ls -la /usr/bin/cadical /usr/bin/cryptominisat5*
-      
-      - name: Download/use instance
+          for b in cadical kissat nonceflow fps; do
+            xz -d -k ${b}.xz || true
+            chmod +x ${b} || true
+          done
+          ls -la cadical kissat nonceflow fps
+
+      - name: Run ${{ matrix.solver }}
         run: |
-          if [ -f instance4.cnf ]; then
-            echo "Using repo instance4.cnf"
+          DEADLINE=${{ github.event.inputs.deadline_sec || '880' }}
+          SOLVER=${{ matrix.solver }}
+          echo "Solving with $SOLVER (deadline ${DEADLINE}s)"
+          head -1 instance4.cnf
+
+          case $SOLVER in
+            cadical)
+              timeout $DEADLINE ./cadical instance4.cnf > cad.txt 2>&1
+              ;;
+            kissat)
+              timeout $DEADLINE ./kissat instance4.cnf > kiss.txt 2>&1
+              ;;
+            nonceflow)
+              timeout $DEADLINE ./nonceflow instance4.cnf $DEADLINE /tmp/race_winner_bits.txt > nf.txt 2>&1
+              ;;
+            fps)
+              timeout $DEADLINE ./fps instance4.cnf /tmp/fps_bits.txt $DEADLINE > fps.txt 2>&1
+              ;;
+          esac
+          echo "RC=$?"
+
+      - name: Extract bits
+        run: |
+          SOLVER=${{ matrix.solver }}
+          case $SOLVER in
+            cadical)
+              grep "^v " cad.txt | sed 's/^v //' | tr ' ' '\n' | grep -v '^0$' | grep -v '^$' | \
+                awk '{n=$1; if(n>0) print "1"; else print "0"}' | tr -d '\n' > winner_bits.txt
+              ;;
+            kissat)
+              grep "^v " kiss.txt | sed 's/^v //' | tr ' ' '\n' | grep -v '^0$' | grep -v '^$' | \
+                awk '{n=$1; if(n>0) print "1"; else print "0"}' | tr -d '\n' > winner_bits.txt
+              ;;
+            nonceflow)
+              cp /tmp/race_winner_bits.txt winner_bits.txt 2>/dev/null || echo -n "" > winner_bits.txt
+              ;;
+            fps)
+              cp /tmp/fps_bits.txt winner_bits.txt 2>/dev/null || echo -n "" > winner_bits.txt
+              ;;
+          esac
+          LEN=$(wc -c < winner_bits.txt)
+          echo "bits_len=$LEN"
+          head -c 80 winner_bits.txt; echo
+
+      - name: Mark result
+        run: |
+          SOLVER=${{ matrix.solver }}
+          # did we get a full-length assignment?
+          LEN=$(wc -c < winner_bits.txt)
+          if [ "$LEN" -gt 0 ]; then
+            echo "OK" > result_$SOLVER.txt
+            echo "$SOLVER bits=$LEN"
           else
-            echo "ERROR: instance4.cnf missing from repo"
-            exit 1
+            echo "NO_SOLUTION" > result_$SOLVER.txt
+            echo "$SOLVER NO_SOLUTION"
           fi
-          wc -l instance4.cnf
-      
-      - name: Parallel SAT race (4 jobs × 2 solvers)
-        run: |
-          DEADLINE=${DEADLINE_SEC:-900}
-          cd /home/runner/work/nonce/nonce
-          
-          timeout $(( DEADLINE + 30 )) bash -c '
-          (
-            echo "=== Job 1: CaDiCaL default ===" >&2
-            cadical instance4.cnf > /tmp/cad1.out 2>&1
-            grep -E "^(s |c |time)" /tmp/cad1.out || echo "NO_SAT"
-          ) &
-          
-          (
-            echo "=== Job 2: CMS default ===" >&2
-            cryptominisat5 instance4.cnf > /tmp/cms1.out 2>&1
-            grep -E "^(s |time)" /tmp/cms1.out || echo "NO_SAT"
-          ) &
-          
-          (
-            echo "=== Job 3: CaDiCaL -q ===" >&2
-            timeout '$DEADLINE' cadical -q instance4.cnf > /tmp/cad2.out 2>&1
-            grep -E "^(s |time)" /tmp/cad2.out || echo "NO_SAT"
-          ) &
-          
-          (
-            echo "=== Job 4: CMS --threads 2 ===" >&2
-            timeout '$DEADLINE' cryptominisat5 --threads 2 instance4.cnf > /tmp/cms2.out 2>&1
-            grep -E "^(s |time)" /tmp/cms2.out || echo "NO_SAT"
-          ) &
-          
-          wait
-          
-          # aggregate
-          echo "=== RACE RESULTS ===" >&2
-          grep "^s SATISFIABLE" /tmp/cad*.out /tmp/cms*.out && echo "WINNER FOUND" || echo "NO_SAT_ALL"
-          ' 2>&1 | tee /tmp/race.log
-      
-      - name: Extract solution
-        run: |
-          # first SAT output wins
-          WINNER=$(grep -l "^s SATISFIABLE" /tmp/cad*.out /tmp/cms*.out 2>/dev/null | head -1)
-          if [ -z "$WINNER" ]; then
-            echo "NO_SOLUTION" | tee /tmp/winner_bits.txt
-            exit 0
-          fi
-          
-          echo "Winner: $WINNER"
-          
-          # parse assignment
-          grep "^v " "$WINNER" | sed 's/^v //g' | tr ' ' '\n' | grep -v "^0$" | \
-            awk '{if($1>0)print "1"; else print "0"}' | tr -d '\n' > /tmp/winner_bits.txt
-          
-          echo "Assignment length: $(wc -c < /tmp/winner_bits.txt)"
-          head -c 100 /tmp/winner_bits.txt && echo
-      
-      - name: Upload solution
-        uses: actions/upload-artifact@v4
+
+      - name: Upload
         if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: nonce-race-results
+          name: race-${{ matrix.solver }}
           path: |
-            /tmp/race.log
-            /tmp/winner_bits.txt
-            /tmp/cad*.out
-            /tmp/cms*.out
+            winner_bits.txt
+            result_${{ matrix.solver }}.txt
+            cad.txt
+            kiss.txt
+            nf.txt
+            fps.txt
           retention-days: 1
-      
-      - name: Notify on SAT
-        if: success()
-        run: |
-          RESULT=$(cat /tmp/winner_bits.txt)
-          if [ "$RESULT" != "NO_SOLUTION" ]; then
-            echo "VERIFIED_WIN: $(echo "$RESULT" | wc -c) bits"
-            exit 0
-          fi
