@@ -1,0 +1,111 @@
+name: NONCE SAT Race
+
+on:
+  push:
+    paths:
+      - 'instance4.cnf'
+  workflow_dispatch:
+    inputs:
+      deadline_sec:
+        description: Solver deadline seconds (default 900)
+        required: false
+        default: '900'
+
+jobs:
+  race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install solvers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cadical cryptominisat5
+          ls -la /usr/bin/cadical /usr/bin/cryptominisat5*
+      
+      - name: Download/use instance
+        run: |
+          if [ -f instance4.cnf ]; then
+            echo "Using repo instance4.cnf"
+          else
+            echo "ERROR: instance4.cnf missing from repo"
+            exit 1
+          fi
+          wc -l instance4.cnf
+      
+      - name: Parallel SAT race (4 jobs × 2 solvers)
+        run: |
+          DEADLINE=${DEADLINE_SEC:-900}
+          cd /home/runner/work/nonce/nonce
+          
+          timeout $(( DEADLINE + 30 )) bash -c '
+          (
+            echo "=== Job 1: CaDiCaL default ===" >&2
+            cadical instance4.cnf > /tmp/cad1.out 2>&1
+            grep -E "^(s |c |time)" /tmp/cad1.out || echo "NO_SAT"
+          ) &
+          
+          (
+            echo "=== Job 2: CMS default ===" >&2
+            cryptominisat5 instance4.cnf > /tmp/cms1.out 2>&1
+            grep -E "^(s |time)" /tmp/cms1.out || echo "NO_SAT"
+          ) &
+          
+          (
+            echo "=== Job 3: CaDiCaL -q ===" >&2
+            timeout '$DEADLINE' cadical -q instance4.cnf > /tmp/cad2.out 2>&1
+            grep -E "^(s |time)" /tmp/cad2.out || echo "NO_SAT"
+          ) &
+          
+          (
+            echo "=== Job 4: CMS --threads 2 ===" >&2
+            timeout '$DEADLINE' cryptominisat5 --threads 2 instance4.cnf > /tmp/cms2.out 2>&1
+            grep -E "^(s |time)" /tmp/cms2.out || echo "NO_SAT"
+          ) &
+          
+          wait
+          
+          # aggregate
+          echo "=== RACE RESULTS ===" >&2
+          grep "^s SATISFIABLE" /tmp/cad*.out /tmp/cms*.out && echo "WINNER FOUND" || echo "NO_SAT_ALL"
+          ' 2>&1 | tee /tmp/race.log
+      
+      - name: Extract solution
+        run: |
+          # first SAT output wins
+          WINNER=$(grep -l "^s SATISFIABLE" /tmp/cad*.out /tmp/cms*.out 2>/dev/null | head -1)
+          if [ -z "$WINNER" ]; then
+            echo "NO_SOLUTION" | tee /tmp/winner_bits.txt
+            exit 0
+          fi
+          
+          echo "Winner: $WINNER"
+          
+          # parse assignment
+          grep "^v " "$WINNER" | sed 's/^v //g' | tr ' ' '\n' | grep -v "^0$" | \
+            awk '{if($1>0)print "1"; else print "0"}' | tr -d '\n' > /tmp/winner_bits.txt
+          
+          echo "Assignment length: $(wc -c < /tmp/winner_bits.txt)"
+          head -c 100 /tmp/winner_bits.txt && echo
+      
+      - name: Upload solution
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nonce-race-results
+          path: |
+            /tmp/race.log
+            /tmp/winner_bits.txt
+            /tmp/cad*.out
+            /tmp/cms*.out
+          retention-days: 1
+      
+      - name: Notify on SAT
+        if: success()
+        run: |
+          RESULT=$(cat /tmp/winner_bits.txt)
+          if [ "$RESULT" != "NO_SOLUTION" ]; then
+            echo "VERIFIED_WIN: $(echo "$RESULT" | wc -c) bits"
+            exit 0
+          fi
