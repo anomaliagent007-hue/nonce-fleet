@@ -7,9 +7,12 @@ on:
   workflow_dispatch:
     inputs:
       deadline_sec:
-        description: Solver deadline seconds (default 880)
+        description: Solver deadline seconds
         required: false
-        default: '880'
+        default: '870'
+
+permissions:
+  contents: read
 
 jobs:
   race:
@@ -24,81 +27,45 @@ jobs:
 
       - name: Unpack solvers
         run: |
-          for b in cadical kissat nonceflow fps; do
-            xz -d -k ${b}.xz || true
-            chmod +x ${b} || true
-          done
-          ls -la cadical kissat nonceflow fps
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xz-utils
+          for f in *.xz; do [ -e "$f" ] && xz -dkf "$f"; done
+          chmod +x cadical kissat nonceflow fps 2>/dev/null || true
+          ls -la cadical kissat nonceflow fps 2>/dev/null || true
+          nproc
 
-      - name: Run ${{ matrix.solver }}
+      - name: Solve
         run: |
-          DEADLINE=${{ github.event.inputs.deadline_sec || '880' }}
-          SOLVER=${{ matrix.solver }}
-          echo "Solving with $SOLVER (deadline ${DEADLINE}s)"
+          DEADLINE="${{ github.event.inputs.deadline_sec }}"
+          DEADLINE="${DEADLINE:-870}"
+          SOLVER="${{ matrix.solver }}"
+          echo "solver=$SOLVER deadline=${DEADLINE}s"
           head -1 instance4.cnf
-
-          case $SOLVER in
-            cadical)
-              timeout $DEADLINE ./cadical instance4.cnf > cad.txt 2>&1
-              ;;
-            kissat)
-              timeout $DEADLINE ./kissat instance4.cnf > kiss.txt 2>&1
-              ;;
-            nonceflow)
-              timeout $DEADLINE ./nonceflow instance4.cnf $DEADLINE /tmp/race_winner_bits.txt > nf.txt 2>&1
-              ;;
-            fps)
-              timeout $DEADLINE ./fps instance4.cnf /tmp/fps_bits.txt $DEADLINE > fps.txt 2>&1
-              ;;
+          set +e
+          case "$SOLVER" in
+            cadical)   timeout "$DEADLINE" ./cadical instance4.cnf > solver_out.txt 2>&1 ;;
+            kissat)    timeout "$DEADLINE" ./kissat instance4.cnf > solver_out.txt 2>&1 ;;
+            nonceflow) timeout "$DEADLINE" ./nonceflow instance4.cnf "$DEADLINE" bits_nonflow.txt > solver_out.txt 2>&1 ;;
+            fps)       timeout "$DEADLINE" ./fps instance4.cnf bits_fps.txt "$DEADLINE" > solver_out.txt 2>&1 ;;
           esac
           echo "RC=$?"
+          tail -5 solver_out.txt 2>/dev/null || true
 
       - name: Extract bits
-        run: |
-          SOLVER=${{ matrix.solver }}
-          case $SOLVER in
-            cadical)
-              grep "^v " cad.txt | sed 's/^v //' | tr ' ' '\n' | grep -v '^0$' | grep -v '^$' | \
-                awk '{n=$1; if(n>0) print "1"; else print "0"}' | tr -d '\n' > winner_bits.txt
-              ;;
-            kissat)
-              grep "^v " kiss.txt | sed 's/^v //' | tr ' ' '\n' | grep -v '^0$' | grep -v '^$' | \
-                awk '{n=$1; if(n>0) print "1"; else print "0"}' | tr -d '\n' > winner_bits.txt
-              ;;
-            nonceflow)
-              cp /tmp/race_winner_bits.txt winner_bits.txt 2>/dev/null || echo -n "" > winner_bits.txt
-              ;;
-            fps)
-              cp /tmp/fps_bits.txt winner_bits.txt 2>/dev/null || echo -n "" > winner_bits.txt
-              ;;
-          esac
-          LEN=$(wc -c < winner_bits.txt)
-          echo "bits_len=$LEN"
-          head -c 80 winner_bits.txt; echo
+        run: python3 tools.py extract ${{ matrix.solver }} instance4.cnf
 
-      - name: Mark result
-        run: |
-          SOLVER=${{ matrix.solver }}
-          # did we get a full-length assignment?
-          LEN=$(wc -c < winner_bits.txt)
-          if [ "$LEN" -gt 0 ]; then
-            echo "OK" > result_$SOLVER.txt
-            echo "$SOLVER bits=$LEN"
-          else
-            echo "NO_SOLUTION" > result_$SOLVER.txt
-            echo "$SOLVER NO_SOLUTION"
-          fi
-
-      - name: Upload
+      - name: Verify assignment
         if: always()
-        uses: actions/upload-artifact@v4
+        run: python3 tools.py verify instance4.cnf winner_bits.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: race-${{ matrix.solver }}
           path: |
             winner_bits.txt
-            result_${{ matrix.solver }}.txt
-            cad.txt
-            kiss.txt
-            nf.txt
-            fps.txt
-          retention-days: 1
+            result.txt
+            verify.txt
+            solver_out.txt
+          retention-days: 7
+          if-no-files-found: warn
